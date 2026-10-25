@@ -27,3 +27,7 @@ Snapshot für Bewerbungen vom 25. Oktober 2026. Der Upload ist kein neuer Funkti
 ## Inhalt und Herkunft
 
 Enthalten sind ausgewählte Quelltexte, Konfiguration und vorhandene Tests. Ausgeschlossen sind Git-Historie, Laufzeitdaten, lokale Zugänge, private Exporte, persönliche Medien und Betriebsprotokolle. Vorhandene Lizenzhinweise von Drittanbietern bleiben erhalten. Eine Veröffentlichung dieser Arbeitsprobe erteilt keine pauschale Lizenz an Marken oder fremden Assets.
+
+## Prüfung dieser Arbeitsprobe
+
+25. Oktober 2026: Syntaxprüfung von 37 JavaScript-Modulen erfolgreich. Medienrendering, Uploads und Anbieteranbindungen wurden bei dieser Veröffentlichung nicht erneut ausgeführt.
