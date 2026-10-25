@@ -1,6 +1,6 @@
 # HEC Content Studio
 
-[Alle öffentlichen Arbeitsproben im Überblick](https://github.com/adrienwottke-stack/engine-playground/blob/main/PORTFOLIO.md)
+[Alle öffentlichen Arbeitsproben im Überblick](https://github.com/adrienwottke-stack/project-portfolio)
 Medienbibliothek und Produktionswerkzeug für wiederverwendbare Videoaufnahmen, Schnittaufträge und nachvollziehbares Content-Lernen.
 
 ## Projekt und Beitrag
