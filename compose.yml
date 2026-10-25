@@ -1,0 +1,43 @@
+name: hec-reel-studio
+services:
+  studio:
+    build: .
+    restart: unless-stopped
+    init: true
+    ports:
+      - "127.0.0.1:4320:4320"
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 4320
+      DATA_DIR: /app/data
+      STUDIO_PUBLIC_URL: ${STUDIO_PUBLIC_URL:-https://reels.127.0.0.1.sslip.io}
+      ANALYSIS_PROVIDER: ${ANALYSIS_PROVIDER:-codex}
+      STUDIO_USER: ${STUDIO_USER:-hec}
+      STUDIO_PASSWORD: ${STUDIO_PASSWORD:?Set a long STUDIO_PASSWORD in .env}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.8-flash}
+      MAX_FILE_MB: ${MAX_FILE_MB:-32768}
+      MAX_SESSION_MB: ${MAX_SESSION_MB:-2048}
+      MAX_FILES: ${MAX_FILES:-30}
+      MAX_STORAGE_MB: ${MAX_STORAGE_MB:-0}
+      STORAGE_RESERVE_MB: ${STORAGE_RESERVE_MB:-3072}
+      UPLOAD_CHUNK_MB: ${UPLOAD_CHUNK_MB:-16}
+      RENDER_WIDTH: ${RENDER_WIDTH:-1080}
+    volumes:
+      - studio-data:/app/data
+    cpus: "1.0"
+    mem_limit: 900m
+    pids_limit: 96
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4320/api/health').then(r=>r.json()).then(x=>{if(!x.ok||!x.engine)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+volumes:
+  studio-data:

@@ -1,0 +1,93 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import {createHash} from 'node:crypto';
+import {Readable} from 'node:stream';
+import {configuration} from '../lib/config.mjs';
+import {MediaLibrary} from '../lib/library.mjs';
+import {StorageCapacity} from '../lib/storage.mjs';
+import {LibraryTransfers} from '../lib/transfers.mjs';
+import {createStudio} from '../server.mjs';
+
+const scratch=path.resolve('..','..','work','tests');await fs.mkdir(scratch,{recursive:true});
+const digest=data=>createHash('sha256').update(data).digest('hex');
+const stream=data=>Object.assign(Readable.from([data]),{headers:{'content-type':'application/octet-stream','content-length':String(data.length)}});
+const volume=async()=>({blocks:10000,bavail:1000,bsize:1});
+async function setup(t) {
+  const dataDir=await fs.mkdtemp(path.join(scratch,'transfers-'));t.after(()=>fs.rm(dataDir,{recursive:true,force:true}));
+  const config={...configuration({DATA_DIR:dataDir}),storageReserveBytes:100,uploadChunkBytes:8};
+  const library=new MediaLibrary(dataDir);await library.initialize();
+  const capacity=new StorageCapacity(config,library,{statfs:volume});const enqueued=[];
+  const transfers=new LibraryTransfers(config,library,capacity,id=>enqueued.push(id));await transfers.initialize();
+  return {config,library,capacity,transfers,enqueued};
+}
+test('free-space accounting includes all volume use, reserve and outstanding transfers',async t=>{
+  const {transfers,capacity,config}=await setup(t);
+  const snapshot=await capacity.snapshot();assert.equal(snapshot.availableBytes,900);assert.equal(snapshot.mode,'volume');
+  const first=await transfers.start({key:digest('first'),name:'first.mov',size:600,fields:{}});
+  assert.equal((await capacity.snapshot(transfers.reserved())).availableBytes,300);
+  await assert.rejects(transfers.start({key:digest('second'),name:'second.mov',size:400,fields:{}}),error=>error.status===507);
+  assert.equal(transfers.items.size,1);
+  await transfers.discard(first.id);assert.equal((await capacity.snapshot(transfers.reserved())).availableBytes,900);
+  config.maxStorageBytes=500;assert.equal((await capacity.snapshot()).availableBytes,500);
+  await assert.rejects(capacity.require(501,transfers.reserved()),error=>error.status===507);
+});
+test('confirmed chunks survive restart, reject corruption, and finish once without duplicate originals',async t=>{
+  const {config,library,capacity,transfers,enqueued}=await setup(t);const bytes=Buffer.from('original-video-fixture');
+  const input={key:digest('original-key'),name:'Original.mov',size:bytes.length,fields:{collection:'First'}};
+  const first=await transfers.start(input);assert.equal((await transfers.start(input)).id,first.id);
+  const part=bytes.subarray(0,8);await transfers.append(first.id,0,part.length,digest(part),stream(part));
+  await assert.rejects(transfers.append(first.id,0,part.length,digest(part),stream(part)),error=>error.status===409);
+  await fs.appendFile(transfers.part(first.id),'unconfirmed-part');
+  const resumed=new LibraryTransfers(config,library,capacity,id=>enqueued.push(id));await resumed.initialize();
+  assert.equal(resumed.get(first.id).offset,8);assert.equal((await fs.stat(resumed.part(first.id))).size,8);
+  const next=bytes.subarray(8,16);await assert.rejects(resumed.append(first.id,8,next.length,digest('wrong'),stream(next)),error=>error.status===400);
+  assert.equal((await fs.stat(resumed.part(first.id))).size,8);
+  for(let offset=8;offset<bytes.length;offset+=8){const body=bytes.subarray(offset,offset+8);await resumed.append(first.id,offset,body.length,digest(body),stream(body));}
+  const saved=await resumed.finish(first.id);assert.equal(saved.status,'complete');assert.equal(library.list().length,1);assert.equal(enqueued.length,1);
+  assert.deepEqual(await fs.readFile(library.get(saved.clip.id).path),bytes);
+  assert.equal((await resumed.finish(first.id)).clip.id,saved.clip.id);assert.equal(enqueued.length,1);
+  const repeated=await resumed.start({...input,fields:{collection:'Second'}});assert.equal(repeated.duplicate,true);
+  assert.deepEqual(repeated.clip.collections,['First','Second']);assert.equal(library.list().length,1);
+  await assert.rejects(resumed.discard(first.id),error=>error.status===409);
+  assert.ok(!JSON.stringify(saved).includes(config.dataDir));
+  await assert.rejects(resumed.start({...input,key:digest('bad'),name:'../bad.txt'}),error=>error.status===400);
+});
+test('expired partial uploads release reserved capacity without deleting completed library originals',async t=>{
+  const {transfers,library,capacity}=await setup(t);
+  const partial=await transfers.start({key:digest('expiry-partial'),name:'Partial.mov',size:600,fields:{}});
+  const bytes=Buffer.from('saved');const saved=await transfers.start({key:digest('expiry-saved'),name:'Saved.mov',size:bytes.length,fields:{}});
+  await transfers.append(saved.id,0,bytes.length,digest(bytes),stream(bytes));const complete=await transfers.finish(saved.id);
+  const old=new Date(Date.now()-8*24*3600_000).toISOString();
+  for(const id of [partial.id,saved.id])await transfers.persist({...transfers.get(id),updatedAt:old});
+  assert.equal((await capacity.snapshot(transfers.reserved())).reservedBytes,0);
+  await transfers.start({key:digest('new-upload'),name:'New.mov',size:400,fields:{}});
+  assert.equal(transfers.items.has(partial.id),false);assert.equal(transfers.items.has(saved.id),false);
+  assert.equal(await fs.readFile(library.get(complete.clip.id).path,'utf8'),'saved');
+  await assert.rejects(fs.access(transfers.directory(partial.id)));
+});
+test('resumable HTTP upload is private, accepts large declarations and uses durable confirmed offsets',async t=>{
+  const dataDir=await fs.mkdtemp(path.join(scratch,'http-transfer-'));
+  const config=configuration({DATA_DIR:dataDir,STUDIO_PASSWORD:'local-resumable-upload-test'});
+  const studio=await createStudio(config,{statfs:async()=>({blocks:2**30,bavail:2**29,bsize:4096})});
+  const server=studio.app.listen(0,'127.0.0.1');await new Promise(resolve=>server.once('listening',resolve));
+  t.after(async()=>{await studio.close();await new Promise(resolve=>server.close(resolve));await fs.rm(dataDir,{recursive:true,force:true});});
+  const base=`http://127.0.0.1:${server.address().port}`,headers={authorization:`Basic ${Buffer.from('hec:local-resumable-upload-test').toString('base64')}`,'x-reel-studio':'1'};
+  const start=async(input,customHeaders=headers)=>fetch(base+'/api/library/transfers',{method:'POST',headers:{...customHeaders,'Content-Type':'application/json'},body:JSON.stringify(input)});
+  const input={key:digest('http'),name:'large.mov',size:3*1024**3,fields:{}};
+  assert.equal((await start(input,{'x-reel-studio':'1'})).status,401);
+  assert.equal((await start(input,{authorization:headers.authorization})).status,403);
+  const response=await start(input);assert.equal(response.status,201);const transfer=await response.json();
+  assert.equal(transfer.size,3*1024**3);assert.equal(transfer.offset,0);
+  assert.equal((await start(input)).status,201);assert.equal(studio.transfers.items.size,1);
+  const body=Buffer.from('actual-http-chunk');
+  const append=offset=>fetch(`${base}/api/library/transfers/${transfer.id}/chunks?offset=${offset}`,{method:'PATCH',headers:{...headers,'Content-Type':'application/octet-stream','x-chunk-size':String(body.length),'x-chunk-sha256':digest(body)},body});
+  const chunk=await append(0);assert.equal(chunk.status,200);assert.equal((await chunk.json()).offset,body.length);
+  assert.equal((await append(0)).status,409);
+  const status=await (await fetch(`${base}/api/library/transfers/${transfer.id}`,{headers})).json();assert.equal(status.offset,body.length);
+  assert.equal((await fetch(`${base}/api/library/transfers/${transfer.id}`)).status,401);
+  assert.equal((await fetch(`${base}/api/library/transfers/${transfer.id}/finish`,{method:'POST',headers})).status,409);
+  assert.equal((await fetch(`${base}/api/library/transfers/${transfer.id}`,{method:'DELETE',headers})).status,200);
+  assert.equal(studio.transfers.reserved().remaining,0);
+});

@@ -1,0 +1,51 @@
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import assert from 'node:assert/strict';
+import { setTimeout as delay } from 'node:timers/promises';
+import { configuration } from '../lib/config.mjs';
+import { createStudio } from '../server.mjs';
+import { run } from '../lib/process.mjs';
+import { probe } from '../lib/media.mjs';
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const scratch = path.resolve(root,'../../work/smoke');
+await fs.mkdir(scratch,{recursive:true});
+const first = path.join(scratch,'horizontal.mp4'), second = path.join(scratch,'vertical.mov');
+const config = configuration({ DATA_DIR:path.join(scratch,'data'), RENDER_WIDTH:'720' });
+await run(config.ffmpeg,['-hide_banner','-loglevel','error','-y','-f','lavfi','-i','testsrc2=size=640x360:rate=30','-f','lavfi','-i','sine=frequency=440:sample_rate=48000','-t','2.5','-c:v','libx264','-threads','1','-pix_fmt','yuv420p','-c:a','aac',first]);
+await run(config.ffmpeg,['-hide_banner','-loglevel','error','-y','-f','lavfi','-i','testsrc2=size=360x640:rate=30','-t','2.5','-c:v','libx264','-threads','1','-pix_fmt','yuv420p','-an',second]);
+const studio = await createStudio(config);
+const server = studio.app.listen(0,'127.0.0.1');
+await new Promise(resolve => server.once('listening',resolve));
+const base = `http://127.0.0.1:${server.address().port}`;
+try {
+  const form = new FormData();
+  form.set('title','Technischer Test · zwei Formate'); form.set('mode','quick'); form.set('duration','15'); form.set('fit','preserve'); form.set('count','1');
+  form.append('videos',new Blob([await fs.readFile(first)],{type:'video/mp4'}),'Querformat mit Ton.mp4');
+  form.append('videos',new Blob([await fs.readFile(second)],{type:'video/quicktime'}),'Hochformat ohne Ton.mov');
+  const response = await fetch(`${base}/api/jobs`,{method:'POST',headers:{'x-reel-studio':'1'},body:form});
+  const initial = await response.json();
+  assert.equal(response.status,202,JSON.stringify(initial));
+  let job;
+  const deadline = Date.now()+120_000;
+  do { await delay(300); job = await (await fetch(`${base}/api/jobs/${initial.id}`)).json(); }
+  while (['queued','processing'].includes(job.status) && Date.now()<deadline);
+  assert.equal(job.status,'done',JSON.stringify(job));
+  assert.equal(job.outputs.length,1);
+  const output = job.outputs[0];
+  assert.equal(output.width,720); assert.equal(output.height,1280);
+  assert.ok(Math.abs(output.duration-5)<0.35);
+  const artifact = await fetch(`${base}${output.videoUrl}`);
+  assert.equal(artifact.headers.get('content-type'),'video/mp4');
+  const demoPath = path.resolve(root,'../reel-studio-probeschnitt.mp4');
+  await fs.writeFile(demoPath,Buffer.from(await artifact.arrayBuffer()));
+  const info = await probe(demoPath,config);
+  assert.equal(info.audio,true);
+  const cover = await fetch(`${base}${output.coverUrl}`); assert.equal(cover.status,200);
+  const caption = await (await fetch(`${base}${output.captionUrl}`)).text(); assert.match(caption,/Ohne KI/);
+  const byteRange = await fetch(`${base}${output.videoUrl}`,{headers:{range:'bytes=0-1023'}}); assert.equal(byteRange.status,206);
+  const badForm = new FormData(); badForm.set('mode','quick'); badForm.append('videos',new Blob(['bad']),'script.txt');
+  assert.equal((await fetch(`${base}/api/jobs`,{method:'POST',headers:{'x-reel-studio':'1'},body:badForm})).status,400);
+  console.log(JSON.stringify({passed:true,mode:'Technical fixture; no real provider or user footage',sources:2,output:{width:info.width,height:info.height,duration:info.duration,audio:info.audio},checks:['multipart upload','landscape + portrait','source with + without audio','ASS title','H.264/AAC export','cover','caption','HTTP byte ranges','reject non-video'],demo:demoPath},null,2));
+} finally { await studio.close(); await new Promise(resolve => server.close(resolve)); }
